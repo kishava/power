@@ -1,0 +1,108 @@
+#!/usr/bin/env python3
+"""Cycle power mode and fan curve when Fn+F is pressed, as MyASUS does."""
+
+import os
+import pwd
+import struct
+import subprocess
+import time
+from pathlib import Path
+
+EVENT_FORMAT = "llHHi"
+EVENT_SIZE = struct.calcsize(EVENT_FORMAT)
+EV_KEY = 0x01
+KEY_FN_F = 0x1E2  # Fn+F, the Vivobook fan / performance key
+PRESS = 1
+
+LABELS = {
+    "saver": ("Silent", "Quiet fan curve"),
+    "balanced": ("Standard", "Standard fan curve"),
+    "performance": ("Performance", "Strong fan curve"),
+}
+
+
+def asus_hotkey_device():
+    for event in sorted(Path("/dev/input").glob("event*")):
+        name_path = Path("/sys/class/input") / event.name / "device" / "name"
+        try:
+            name = name_path.read_text().strip()
+        except OSError:
+            continue
+        if name == "Asus WMI hotkeys":
+            return event
+    return None
+
+
+def active_user():
+    runtime = Path("/run/user")
+    if not runtime.exists():
+        return None
+    for folder in runtime.iterdir():
+        if not folder.name.isdigit() or not (folder / "bus").exists():
+            continue
+        try:
+            account = pwd.getpwuid(int(folder.name))
+        except KeyError:
+            continue
+        return account.pw_name, int(folder.name)
+    return None
+
+
+def notify(mode):
+    title, body = LABELS.get(mode, (mode, ""))
+    session = active_user()
+    if session is None:
+        return
+    name, uid = session
+    env = os.environ.copy()
+    env["DISPLAY"] = ":0"
+    env["XDG_RUNTIME_DIR"] = f"/run/user/{uid}"
+    env["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path=/run/user/{uid}/bus"
+    subprocess.run(
+        ["sudo", "-u", name, "notify-send", "-a", "Power", "-i", "preferences-system-power", title, body],
+        env=env,
+        check=False,
+    )
+
+
+def cycle():
+    result = subprocess.run(
+        ["/usr/local/sbin/power-mode", "cycle"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    mode = (result.stdout or "").strip().splitlines()
+    chosen = mode[-1] if mode else ""
+    if result.returncode == 0 and chosen:
+        print(f"Fn+F -> {chosen}", flush=True)
+        notify(chosen)
+    else:
+        print(result.stderr.strip() or "power-mode cycle failed", flush=True)
+
+
+def main():
+    device = None
+    while device is None:
+        device = asus_hotkey_device()
+        if device is None:
+            time.sleep(2)
+    print(f"Listening for Fn+F on {device}", flush=True)
+    last = 0.0
+    with device.open("rb", buffering=0) as handle:
+        while True:
+            data = handle.read(EVENT_SIZE)
+            if len(data) != EVENT_SIZE:
+                continue
+            _sec, _usec, ev_type, code, value = struct.unpack(EVENT_FORMAT, data)
+            if ev_type != EV_KEY or code != KEY_FN_F or value != PRESS:
+                continue
+            now = time.monotonic()
+            if now - last < 0.4:
+                continue
+            last = now
+            cycle()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,190 @@
+#!/usr/bin/env python3
+"""Choose the fan curve from CPU temperature.
+
+The power mode you pick is left alone. This only changes the firmware fan
+profile: quiet when the CPU is cool, standard when it warms up, and the
+strong profile when it is hot. Direct fan-speed writes are not available on
+this Vivobook, so the profile is the control the hardware accepts.
+"""
+
+import signal
+import sys
+import time
+from pathlib import Path
+
+INTERVAL = 5
+# Speed up at these temperatures. Slow back down a few degrees later
+# so the fans do not pulse around one point.
+UP_STANDARD = 58
+UP_STRONG = 75
+DOWN_STANDARD = 52
+DOWN_STRONG = 68
+STATUS = Path("/var/lib/power-mode/fan")
+MODE = Path("/var/lib/power-mode/current")
+PROFILE = Path("/sys/firmware/acpi/platform_profile")
+CHOICES = Path("/sys/firmware/acpi/platform_profile_choices")
+
+running = True
+
+
+def stop(_signum, _frame):
+    global running
+    running = False
+
+
+def read_text(path):
+    try:
+        return Path(path).read_text().strip()
+    except OSError:
+        return ""
+
+
+def cpu_temp():
+    packages = []
+    cores = []
+    for folder in Path("/sys/class/hwmon").glob("hwmon*"):
+        if read_text(folder / "name") != "coretemp":
+            continue
+        for label in folder.glob("temp*_label"):
+            raw = read_text(label.with_name(label.name.replace("label", "input")))
+            if not raw.isdigit():
+                continue
+            value = int(raw) / 1000
+            name = read_text(label)
+            if "Package" in name:
+                packages.append(value)
+            elif name.startswith("Core"):
+                cores.append(value)
+    if packages:
+        return max(packages)
+    if cores:
+        return max(cores)
+    return None
+
+
+def resolve(curve):
+    choices = read_text(CHOICES).split()
+    order = {
+        "quiet": ("quiet", "low-power", "balanced"),
+        "balanced": ("balanced", "quiet"),
+        "performance": ("performance", "balanced"),
+    }[curve]
+    for name in order:
+        if name in choices:
+            return name
+    return None
+
+
+def next_curve(temp, current):
+    if current == "performance":
+        if temp >= DOWN_STRONG:
+            return "performance"
+        if temp >= DOWN_STANDARD:
+            return "balanced"
+        return "quiet"
+    if current == "balanced":
+        if temp >= UP_STRONG:
+            return "performance"
+        if temp >= DOWN_STANDARD:
+            return "balanced"
+        return "quiet"
+    if temp >= UP_STRONG:
+        return "performance"
+    if temp >= UP_STANDARD:
+        return "balanced"
+    return "quiet"
+
+
+def apply_epp():
+    mode = read_text(MODE) or "saver"
+    sample = Path("/sys/devices/system/cpu/cpu0/cpufreq/energy_performance_available_preferences")
+    available = read_text(sample).split()
+    if not available:
+        return
+    wanted = {
+        "saver": ("power", "balance_power", "balance_performance"),
+        "balanced": ("balance_power", "balance_performance", "default"),
+        "performance": ("performance", "balance_performance", "default"),
+    }.get(mode, ("power", "balance_power"))
+    picked = next((name for name in wanted if name in available), None)
+    if picked is None:
+        return
+    for path in Path("/sys/devices/system/cpu").glob("cpu[0-9]*/cpufreq/energy_performance_preference"):
+        try:
+            path.write_text(picked)
+        except OSError:
+            pass
+
+
+def write_profile(name):
+    current = read_text(PROFILE)
+    if current == name:
+        return False
+    PROFILE.write_text(name)
+    return True
+
+
+def write_status(curve, temp):
+    STATUS.parent.mkdir(parents=True, exist_ok=True)
+    temp_text = "unknown" if temp is None else str(int(round(temp)))
+    STATUS.write_text(f"curve={curve}\ntemp={temp_text}\n")
+    STATUS.chmod(0o644)
+
+
+def curve_for_saved_mode():
+    mode = read_text(MODE) or "saver"
+    return {"saver": "quiet", "balanced": "balanced", "performance": "performance"}.get(mode, "quiet")
+
+
+def raise_to_floor(curve):
+    rank = {"quiet": 0, "balanced": 1, "performance": 2}
+    floor = curve_for_saved_mode()
+    if rank[curve] >= rank[floor]:
+        return curve
+    return floor
+
+
+def main():
+    if not PROFILE.exists():
+        print("No platform fan profile on this computer; fan service idle.", flush=True)
+        while running:
+            time.sleep(INTERVAL)
+        return 0
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    current = "quiet"
+    announced = None
+    while running:
+        temp = cpu_temp()
+        if temp is None:
+            write_status(current, None)
+            time.sleep(INTERVAL)
+            continue
+        current = raise_to_floor(next_curve(temp, current))
+        target = resolve(current)
+        changed = False
+        if target is not None:
+            try:
+                changed = write_profile(target)
+            except OSError as error:
+                print(f"Could not set fan curve {target}: {error}", flush=True)
+        apply_epp()
+        write_status(current, temp)
+        if changed and announced != current:
+            print(f"Fan curve {current} at {temp:.0f} °C", flush=True)
+            announced = current
+        time.sleep(INTERVAL)
+
+    # Stopping the service returns the fan curve to the chosen power mode.
+    fallback = resolve(curve_for_saved_mode())
+    if fallback is not None:
+        try:
+            write_profile(fallback)
+        except OSError:
+            pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

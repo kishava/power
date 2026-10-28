@@ -1,0 +1,228 @@
+#!/bin/sh
+# Power modes and charge limit. The charger does not switch modes.
+# Fan curves are handled separately by power-fan, from CPU temperature.
+# Commands: saver | balanced | performance | charge 80|100 | backlight N | status | apply-saved
+set -eu
+
+STATE_DIR=/var/lib/power-mode
+MODE_FILE=$STATE_DIR/current
+CHARGE_FILE=$STATE_DIR/charge
+
+mkdir_state() {
+    mkdir -p "$STATE_DIR"
+    chmod 755 "$STATE_DIR"
+}
+
+platform_choices() {
+    cat /sys/firmware/acpi/platform_profile_choices 2>/dev/null || true
+}
+
+pick_word() {
+    # pick_word "wanted words..." "available words..."
+    wanted=$1
+    available=$2
+    for want in $wanted; do
+        for have in $available; do
+            if [ "$want" = "$have" ]; then
+                echo "$want"
+                return 0
+            fi
+        done
+    done
+    return 1
+}
+
+set_platform() {
+    label=$1
+    [ -e /sys/firmware/acpi/platform_profile ] || return 0
+    case "$label" in
+        saver) wanted="quiet low-power balanced" ;;
+        balanced) wanted="balanced quiet" ;;
+        performance) wanted="performance balanced" ;;
+        *) return 0 ;;
+    esac
+    picked=$(pick_word "$wanted" "$(platform_choices)") || return 0
+    i=0
+    while [ "$i" -lt 20 ]; do
+        if echo "$picked" > /sys/firmware/acpi/platform_profile 2>/dev/null; then
+            return 0
+        fi
+        i=$((i + 1))
+        sleep 0.5
+    done
+}
+
+set_epp() {
+    label=$1
+    sample=/sys/devices/system/cpu/cpu0/cpufreq/energy_performance_available_preferences
+    [ -e "$sample" ] || return 0
+    case "$label" in
+        saver) wanted="power balance_power balance_performance" ;;
+        balanced) wanted="balance_power balance_performance default" ;;
+        performance) wanted="performance balance_performance default" ;;
+        *) return 0 ;;
+    esac
+    picked=$(pick_word "$wanted" "$(cat "$sample")") || return 0
+    for f in /sys/devices/system/cpu/cpu[0-9]*/cpufreq/energy_performance_preference; do
+        [ -e "$f" ] || continue
+        echo "$picked" > "$f" 2>/dev/null || true
+    done
+}
+
+set_gpu() {
+    token=$1
+    for f in /sys/devices/pci*/0000:*/drm/card*/device/tile0/gt*/freq0/power_profile \
+        /sys/devices/pci0000:00/0000:00:02.0/tile0/gt*/freq0/power_profile; do
+        [ -e "$f" ] || continue
+        if grep -q "$token" "$f" 2>/dev/null; then
+            echo "$token" > "$f" 2>/dev/null || true
+        fi
+    done
+}
+
+battery_threshold() {
+    for f in /sys/class/power_supply/BAT*/charge_control_end_threshold; do
+        if [ -e "$f" ]; then
+            echo "$f"
+            return 0
+        fi
+    done
+    return 1
+}
+
+kbd_brightness() {
+    for f in /sys/class/leds/*kbd_backlight/brightness; do
+        if [ -e "$f" ]; then
+            echo "$f"
+            return 0
+        fi
+    done
+    return 1
+}
+
+apply_saved_charge() {
+    [ -f "$CHARGE_FILE" ] || return 0
+    value=$(cat "$CHARGE_FILE")
+    path=$(battery_threshold) || return 0
+    echo "$value" > "$path" 2>/dev/null || true
+}
+
+apply_mode() {
+    label=$1
+    case "$label" in
+        saver)
+            set_platform saver
+            set_epp saver
+            set_gpu power_saving
+            ;;
+        balanced)
+            set_platform balanced
+            set_epp balanced
+            set_gpu base
+            ;;
+        performance)
+            set_platform performance
+            set_epp performance
+            set_gpu base
+            ;;
+        *)
+            echo "unknown mode: $label" >&2
+            exit 2
+            ;;
+    esac
+    if [ -e /sys/module/snd_hda_intel/parameters/power_save ]; then
+        echo 1 > /sys/module/snd_hda_intel/parameters/power_save 2>/dev/null || true
+    fi
+    mkdir_state
+    printf '%s\n' "$label" > "$MODE_FILE"
+    chmod 644 "$MODE_FILE"
+    apply_saved_charge
+    echo "$label"
+}
+
+set_charge() {
+    value=$1
+    case "$value" in
+        80|100) ;;
+        *)
+            echo "charge limit must be 80 or 100" >&2
+            exit 2
+            ;;
+    esac
+    path=$(battery_threshold) || {
+        echo "this computer has no charge-limit control" >&2
+        exit 1
+    }
+    echo "$value" > "$path"
+    mkdir_state
+    printf '%s\n' "$value" > "$CHARGE_FILE"
+    chmod 644 "$CHARGE_FILE"
+    echo "$value"
+}
+
+set_backlight() {
+    value=$1
+    case "$value" in
+        ''|*[!0-9]*)
+            echo "backlight level must be a number" >&2
+            exit 2
+            ;;
+    esac
+    path=$(kbd_brightness) || {
+        echo "this computer has no keyboard light control" >&2
+        exit 1
+    }
+    max=$(cat "$(dirname "$path")/max_brightness")
+    if [ "$value" -gt "$max" ]; then
+        value=$max
+    fi
+    echo "$value" > "$path"
+    echo "$value"
+}
+
+show_status() {
+    mode=unknown
+    [ -f "$MODE_FILE" ] && mode=$(cat "$MODE_FILE")
+    profile=$(cat /sys/firmware/acpi/platform_profile 2>/dev/null || echo none)
+    epp=$(cat /sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference 2>/dev/null || echo none)
+    charge=none
+    if path=$(battery_threshold); then
+        charge=$(cat "$path")
+    fi
+    backlight=none
+    backlight_max=none
+    if path=$(kbd_brightness); then
+        backlight=$(cat "$path")
+        backlight_max=$(cat "$(dirname "$path")/max_brightness")
+    fi
+    printf 'mode=%s\nprofile=%s\nepp=%s\ncharge=%s\nbacklight=%s\nbacklight_max=%s\n' \
+        "$mode" "$profile" "$epp" "$charge" "$backlight" "$backlight_max"
+}
+
+case "${1:-}" in
+    saver|power-saver|quiet) apply_mode saver ;;
+    balanced|balance) apply_mode balanced ;;
+    performance|perf) apply_mode performance ;;
+    cycle)
+        saved=saver
+        [ -f "$MODE_FILE" ] && saved=$(cat "$MODE_FILE")
+        case "$saved" in
+            saver) apply_mode balanced ;;
+            balanced) apply_mode performance ;;
+            performance) apply_mode saver ;;
+            *) apply_mode balanced ;;
+        esac
+        ;;
+    charge) set_charge "${2:-}" ;;
+    backlight) set_backlight "${2:-}" ;;
+    status) show_status ;;
+    apply-saved)
+        saved=saver
+        [ -f "$MODE_FILE" ] && saved=$(cat "$MODE_FILE")
+        apply_mode "$saved"
+        ;;
+    *)
+        echo "usage: power-mode saver|balanced|performance|cycle|charge 80|100|backlight N|status|apply-saved" >&2
+        exit 2
+        ;;
+esac
